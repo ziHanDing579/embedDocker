@@ -1,0 +1,36 @@
+name: Unit Test
+
+on:
+  workflow_call:
+
+jobs:
+  unit-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.12
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements-dev.txt
+      
+    - name: Export model
+      run: |
+        python export.py
+
+    - name: Verify model files
+      run: |
+        ls -l model/
+        ls -l model/onnx/
+        ls -l model/tokenizer.json
+
+    - name: Run tests
+      run: |
+        pytest
