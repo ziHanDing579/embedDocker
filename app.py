@@ -37,3 +37,15 @@ def encode(text):
 
     embedding = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
     return embedding
+
+def handler(event, context):
+    raw = event.get("body")
+    if raw is None:
+        return {"statusCode": 400, "body": json.dumps({"error": "missing body"})}
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"statusCode": 400, "body": json.dumps({"error": "invalid JSON"})}
+    text = body.get("text", "")
+    embedding = encode(text)
+    return {"statusCode": 200, "body": json.dumps({"embedding": embedding.tolist()})}
