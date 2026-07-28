@@ -1,12 +1,11 @@
-FROM public.ecr.aws/lambda/python:3.12
+FROM --platform=linux/arm64 public.ecr.aws/lambda/python:3.12
 
-# Deps installed into the Lambda task root
-COPY requirements.txt ${LAMBDA_TASK_ROOT}
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
 
-# Your code + baked-in model weights
-COPY app.py ${LAMBDA_TASK_ROOT}
-COPY model/ ${LAMBDA_TASK_ROOT}/model/
+COPY model/onnx/model_qint8_arm64.onnx ${LAMBDA_TASK_ROOT}/model/onnx/
+COPY model/tokenizer.json ${LAMBDA_TASK_ROOT}/model/
+COPY app.py     ${LAMBDA_TASK_ROOT}/
 
-# handler = "<filename>.<function name>"
-CMD ["app.handler"]
+# LAMBDA_TASK_ROOT is /var/task; the handler is module.function
+CMD [ "app.handler" ]
