@@ -1,9 +1,9 @@
-FROM --platform=linux/arm64 public.ecr.aws/lambda/python:3.12
+FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12
 
 COPY requirements.txt ${LAMBDA_TASK_ROOT}/
 RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
 
-COPY model/onnx/model_qint8_arm64.onnx ${LAMBDA_TASK_ROOT}/model/onnx/
+COPY model/onnx/model.onnx ${LAMBDA_TASK_ROOT}/model/onnx/
 COPY model/tokenizer.json ${LAMBDA_TASK_ROOT}/model/
 COPY app.py     ${LAMBDA_TASK_ROOT}/
 

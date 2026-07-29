@@ -6,7 +6,7 @@ import numpy as np
 tokenizer = Tokenizer.from_file("model/tokenizer.json")
 tokenizer.enable_truncation(max_length=256)
 tokenizer.enable_padding(direction="right")
-session = ort.InferenceSession("model/onnx/model_qint8_arm64.onnx")
+session = ort.InferenceSession("model/onnx/model.onnx")
 
 input_names = [input.name for input in session.get_inputs()]
 
