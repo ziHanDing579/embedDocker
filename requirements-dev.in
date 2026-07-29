@@ -1,0 +1,5 @@
+-r requirements.in
+
+pytest>=8.0.0
+sentence_transformers>=4.0.0
+optimum[onnxruntime]
