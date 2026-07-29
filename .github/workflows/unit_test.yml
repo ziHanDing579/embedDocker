@@ -8,38 +8,38 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v4
-      with:
-        python-version: 3.12
-        cache: "pip"
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+          cache: "pip"
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements-dev.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
 
-    - name: Cache exported model
+      - name: Cache exported model
         id: model-cache
         uses: actions/cache@v4
         with:
           path: model/
           key: model-${{ hashFiles('export.py', 'requirements-dev.txt') }}
-      
-    - name: Export model
-      if: steps.model-cache.outputs.cache-hit != 'true'
-      run: |
-        python export.py
 
-    - name: Verify model files
-      run: |
-        ls -l model/
-        ls -l model/onnx/
-        ls -l model/tokenizer.json
+      - name: Export model
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          python export.py
 
-    - name: Run tests
-      run: |
-        pytest -v
+      - name: Verify model files
+        run: |
+          ls -l model/
+          ls -l model/onnx/
+          ls -l model/tokenizer.json
+
+      - name: Run tests
+        run: |
+          pytest -v
