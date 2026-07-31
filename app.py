@@ -48,4 +48,4 @@ def handler(event, context):
         return {"statusCode": 400, "body": json.dumps({"error": "invalid JSON"})}
     text = body.get("text", "")
     embedding = encode(text)
-    return {"statusCode": 200, "body": json.dumps({"embedding": embedding[0].tolist()})}
+    return {"statusCode": 200, "body": json.dumps({"embedding": embedding.tolist()})}
