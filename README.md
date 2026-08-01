@@ -12,3 +12,8 @@ There are many different embedding models out there, notably, the `bge-large-en`
 I did not know about ONNX before this project. Mostly because CPU inference with limited resources was not the chief concern in my work. However, for this demo tool that is meant to run on AWS Lambda, I had to consider the cold start and limited storage capacity. This meant I had to consider Pytorch and sentence-transformers, both of which brings in massive dependencies that bloats the size of the container to well above 1 GB (though I am aware that we have 10 GBs).
 
 ONNX runtime helps to do two things - one, reduce package size and two, reduce CPU inference time. Unlike a all-in-one framework like Pytorch, ONNX was specialized and perfect for my use case. No training needed, just running the model. It also supports quantization so if I do need to switch `miniLM` to something bigger, there would be minimal changes to the code.
+
+### ECR and SSM
+Given that the project is ran on AWS Lambda, the container needed to go to the ECR. For this repo, I chose to go with a manually created ECR role and policy instead of IaC. I could have used terraform, but it adds an additional layer when I've already split the responsibilities by having a container repo.
+
+As for the SSM to store my tags, the main reason is that I would like the Terraform pipeline to be more automated. Having a `latest` tag would mean that Terraform cannot actively detect a change in the image, and hardcoding the value goes against IaC principles. So SSM and SHA hashes as tags seemed the natural choice.
