@@ -1,7 +1,12 @@
 import json
-import onnxruntime as ort
-from tokenizers import Tokenizer
+import time
+
 import numpy as np
+import onnxruntime as ort
+from opentelemetry.trace.status import Status, StatusCode
+from tokenizers import Tokenizer
+
+import otel_setup as otel
 
 tokenizer = Tokenizer.from_file("model/tokenizer.json")
 tokenizer.enable_truncation(max_length=256)
@@ -20,15 +25,19 @@ def encode(text):
     attention_mask = np.array([e.attention_mask for e in enc], dtype=np.int64)
 
     feed = {
-        "input_ids": input_ids, 
-        "attention_mask": attention_mask
-        }
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+    }
 
     if "token_type_ids" in input_names:
         token_type_ids = np.array([e.type_ids for e in enc], dtype=np.int64)
         feed["token_type_ids"] = token_type_ids
 
-    output = session.run(None, feed)[0]
+    with otel.tracer.start_as_current_span("onnx.inference") as span:
+        span.set_attribute("batch.size", len(enc))
+        t0 = time.perf_counter()
+        output = session.run(None, feed)[0]
+        otel.inference_hist.record(time.perf_counter() - t0)
 
     mask = attention_mask[:, :, None].astype(np.float32)
     summed = (output * mask).sum(axis=1)
@@ -38,14 +47,44 @@ def encode(text):
     embedding = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
     return embedding
 
+
 def handler(event, context):
-    raw = event.get("body")
-    if raw is None:
-        return {"statusCode": 400, "body": json.dumps({"error": "missing body"})}
-    try:
-        body = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"statusCode": 400, "body": json.dumps({"error": "invalid JSON"})}
-    text = body.get("text", "")
-    embedding = encode(text)
-    return {"statusCode": 200, "body": json.dumps({"embedding": embedding.tolist()})}
+    start = time.perf_counter()
+    with otel.tracer.start_as_current_span("embed.handler") as span:
+        try:
+            raw = event.get("body")
+            if raw is None:
+                otel.request_counter.add(1, {"outcome": "bad_request"})
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": "missing body"}),
+                }
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError:
+                otel.request_counter.add(1, {"outcome": "bad_request"})
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": "invalid JSON"}),
+                }
+
+            text = body.get("text", "")
+            n = 1 if isinstance(text, str) else len(text)
+            otel.batch_hist.record(n)
+            span.set_attribute("batch.size", n)
+
+            embedding = encode(text)
+
+            otel.request_counter.add(1, {"outcome": "ok"})
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"embedding": embedding.tolist()}),
+            }
+        except Exception as e:
+            otel.request_counter.add(1, {"outcome": "error"})
+            span.record_exception(e)
+            span.set_status(Status(StatusCode.ERROR, str(e)))
+            raise
+        finally:
+            otel.duration_hist.record(time.perf_counter() - start)
+            otel.flush()
