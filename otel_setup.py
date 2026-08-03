@@ -63,6 +63,23 @@ def _configure_exporters():
     trace.set_tracer_provider(_tracer_provider)
 
     # --- Metrics ---
+    # Durations are recorded in SECONDS, but OTel's default histogram buckets
+    # (0, 5, 10, 25, ... 10000) are meant for milliseconds. Left as-is, every
+    # sub-5s request lands in the first [0, 5] bucket and histogram_quantile
+    # just returns 5 * quantile (p50->2.5, p95->4.75). These views override the
+    # buckets with second-scale boundaries: dense from 5ms to 1s where warm
+    # invocations live, with headroom to 10s for cold starts.
+    latency_buckets = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+    duration_views = [
+        View(
+            instrument_name=name,
+            aggregation=ExplicitBucketHistogramAggregation(
+                boundaries=latency_buckets
+            ),
+        )
+        for name in ("embed.duration", "embed.inference.duration")
+    ]
+
     _meter_provider = MeterProvider(
         resource=resource,
         metric_readers=[
@@ -72,6 +89,7 @@ def _configure_exporters():
                 )
             )
         ],
+        views=duration_views,
     )
     metrics.set_meter_provider(_meter_provider)
 
