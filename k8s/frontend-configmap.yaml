@@ -1,0 +1,1244 @@
+apiVersion: v1
+data:
+  app.js: |-
+    // app.js
+    // Capture sentences, embed them, and plot each one by its cosine similarity to
+    // two sentences you choose: one for the X axis, one for the Y axis.
+
+    import { CONFIG } from "./config.js";
+    import { getEmbedding } from "./embeddings.js";
+    import { cosineSimilarity, clamp01 } from "./linalg.js";
+    import { Plot } from "./chart.js";
+
+    const state = {
+      sentences: [], // { id, text, embedding }
+      xAxisId: null, // id of the sentence defining the X axis
+      yAxisId: null, // id of the sentence defining the Y axis
+      points: [], // { id, text, x, y, isX, isY }
+    };
+
+    let seq = 0;
+    const nextId = () => `s${++seq}`;
+
+    const els = {
+      form: document.getElementById("capture-form"),
+      input: document.getElementById("sentence-input"),
+      submit: document.getElementById("submit-btn"),
+      list: document.getElementById("sentence-list"),
+      count: document.getElementById("count"),
+      mode: document.getElementById("mode"),
+      xText: document.getElementById("x-text"),
+      yText: document.getElementById("y-text"),
+      status: document.getElementById("status"),
+      svg: document.getElementById("plot"),
+    };
+
+    const plot = new Plot(els.svg);
+    els.mode.textContent = CONFIG.USE_MOCK ? "MOCK" : "LIVE";
+
+    const find = (id) => state.sentences.find((s) => s.id === id) || null;
+    const embOf = (id) => (find(id) ? find(id).embedding : null);
+    const textOf = (id) => (find(id) ? find(id).text : null);
+
+    // ---- Axis selection -------------------------------------------------------
+
+    function setXAxis(id) {
+      state.xAxisId = id;
+      recomputeAndRender();
+      setStatus(`X axis set to “${truncate(textOf(id), 40)}”`);
+    }
+
+    function setYAxis(id) {
+      state.yAxisId = id;
+      recomputeAndRender();
+      setStatus(`Y axis set to “${truncate(textOf(id), 40)}”`);
+    }
+
+    // ---- Projection -----------------------------------------------------------
+
+    function recomputeAndRender() {
+      const xVec = embOf(state.xAxisId);
+      const yVec = embOf(state.yAxisId);
+      const ready = Boolean(xVec && yVec);
+
+      state.points = ready
+        ? state.sentences.map((s) => ({
+            id: s.id,
+            text: s.text,
+            x: clamp01(cosineSimilarity(s.embedding, xVec)),
+            y: clamp01(cosineSimilarity(s.embedding, yVec)),
+            isX: s.id === state.xAxisId,
+            isY: s.id === state.yAxisId,
+          }))
+        : [];
+
+      plot.setAxisTitles(textOf(state.xAxisId), textOf(state.yAxisId));
+      plot.render(state.points);
+      renderList();
+      renderReadout();
+    }
+
+    async function addSentence(text) {
+      setBusy(true, "Embedding…");
+      try {
+        const embedding = await getEmbedding(text);
+        const entry = { id: nextId(), text, embedding };
+        state.sentences.push(entry);
+
+        // Sensible defaults so there's an immediate plot: 1st sentence -> X, 2nd -> Y.
+        // Everything is reassignable from the sidebar afterward.
+        if (state.xAxisId === null) state.xAxisId = entry.id;
+        else if (state.yAxisId === null) state.yAxisId = entry.id;
+
+        recomputeAndRender();
+
+        if (state.xAxisId && state.yAxisId) {
+          setStatus(`Plotted “${truncate(text, 40)}”`);
+        } else if (!state.yAxisId) {
+          setStatus(`Added “${truncate(text, 28)}”. Now choose a Y sentence.`);
+        } else {
+          setStatus(`Added “${truncate(text, 28)}”. Now choose an X sentence.`);
+        }
+      } catch (err) {
+        console.error(err);
+        setStatus(
+          CONFIG.USE_MOCK
+            ? "Something went wrong generating the embedding."
+            : "Couldn't reach the embedding endpoint. Check EMBEDDING_ENDPOINT in config.js, or set USE_MOCK to true.",
+          true
+        );
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    // ---- Sidebar + readout ----------------------------------------------------
+
+    function renderList() {
+      els.count.textContent = String(state.sentences.length);
+      els.list.replaceChildren();
+
+      for (const s of state.sentences) {
+        const p = state.points.find((pt) => pt.id === s.id);
+        const isX = s.id === state.xAxisId;
+        const isY = s.id === state.yAxisId;
+
+        const row = document.createElement("div");
+        row.className = "row" + (isX ? " is-x" : "") + (isY ? " is-y" : "");
+
+        const txt = document.createElement("span");
+        txt.className = "row-text";
+        txt.textContent = s.text;
+
+        const coord = document.createElement("span");
+        coord.className = "row-coord";
+        coord.textContent = p ? `${p.x.toFixed(2)}, ${p.y.toFixed(2)}` : "";
+
+        const actions = document.createElement("div");
+        actions.className = "row-actions";
+
+        const bx = document.createElement("button");
+        bx.type = "button";
+        bx.className = "ax-btn ax-x" + (isX ? " active" : "");
+        bx.textContent = "X";
+        bx.title = "Use as X axis";
+        bx.setAttribute("aria-pressed", String(isX));
+        bx.addEventListener("click", () => setXAxis(s.id));
+
+        const by = document.createElement("button");
+        by.type = "button";
+        by.className = "ax-btn ax-y" + (isY ? " active" : "");
+        by.textContent = "Y";
+        by.title = "Use as Y axis";
+        by.setAttribute("aria-pressed", String(isY));
+        by.addEventListener("click", () => setYAxis(s.id));
+
+        actions.append(bx, by);
+        row.append(txt, coord, actions);
+        els.list.appendChild(row);
+      }
+    }
+
+    function renderReadout() {
+      const x = textOf(state.xAxisId);
+      const y = textOf(state.yAxisId);
+      els.xText.textContent = x || "choose a sentence";
+      els.yText.textContent = y || "choose a sentence";
+      els.xText.classList.toggle("unset", !x);
+      els.yText.classList.toggle("unset", !y);
+    }
+
+    // ---- UI plumbing ----------------------------------------------------------
+
+    function setBusy(busy, label) {
+      els.submit.disabled = busy;
+      els.input.disabled = busy;
+      els.submit.textContent = busy ? label || "…" : "Plot";
+      if (!busy) els.input.focus();
+    }
+
+    function setStatus(msg, isError = false) {
+      els.status.textContent = msg;
+      els.status.classList.toggle("is-error", isError);
+    }
+
+    function truncate(str, n) {
+      if (!str) return "";
+      return str.length > n ? str.slice(0, n - 1) + "…" : str;
+    }
+
+    els.form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const text = els.input.value.trim();
+      if (!text) return;
+      els.input.value = "";
+      addSentence(text);
+    });
+
+    // First paint.
+    recomputeAndRender();
+    setStatus(
+      CONFIG.USE_MOCK
+        ? "Running on the local mock. Set USE_MOCK to false in config.js for real embeddings."
+        : "Add sentences, then assign one to X and one to Y."
+    );
+  chart.js: |-
+    // chart.js
+    // A dependency-free SVG scatter plot confined to the first quadrant [0,1] x [0,1].
+    // X = cosine similarity to the X-axis sentence, Y = cosine similarity to the
+    // Y-axis sentence. Points are keyed by id so that changing an axis animates them.
+
+    const NS = "http://www.w3.org/2000/svg";
+    const TICKS = [0, 0.25, 0.5, 0.75, 1];
+
+    function el(name, attrs = {}) {
+      const node = document.createElementNS(NS, name);
+      for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+      return node;
+    }
+
+    function truncate(s, n) {
+      return s && s.length > n ? s.slice(0, n - 1) + "…" : s;
+    }
+
+    export class Plot {
+      constructor(svg) {
+        this.svg = svg;
+        this.W = 760;
+        this.H = 560;
+        this.pad = { t: 28, r: 28, b: 66, l: 70 };
+        this.nodes = new Map(); // id -> <g> for a point
+
+        this.svg.setAttribute("viewBox", `0 0 ${this.W} ${this.H}`);
+        this.svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+        this.svg.setAttribute("role", "img");
+        this.svg.setAttribute("aria-label", "Scatter plot of sentence similarities");
+
+        this._buildStatic();
+      }
+
+      get plotW() {
+        return this.W - this.pad.l - this.pad.r;
+      }
+      get plotH() {
+        return this.H - this.pad.t - this.pad.b;
+      }
+      px(x) {
+        return this.pad.l + x * this.plotW;
+      }
+      py(y) {
+        return this.pad.t + (1 - y) * this.plotH;
+      }
+
+      _buildStatic() {
+        const { pad } = this;
+        const x0 = this.px(0);
+        const y0 = this.py(0);
+        const x1 = this.px(1);
+        const y1 = this.py(1);
+
+        this.svg.appendChild(
+          el("rect", {
+            x: pad.l,
+            y: pad.t,
+            width: this.plotW,
+            height: this.plotH,
+            rx: 6,
+            class: "plate-bg",
+          })
+        );
+
+        const grid = el("g", { class: "grid" });
+        for (const t of TICKS) {
+          const gx = this.px(t);
+          const gy = this.py(t);
+          grid.appendChild(el("line", { x1: gx, y1: y0, x2: gx, y2: y1, class: "gridline" }));
+          grid.appendChild(el("line", { x1: x0, y1: gy, x2: x1, y2: gy, class: "gridline" }));
+
+          const tx = el("text", { x: gx, y: y0 + 20, class: "tick" });
+          tx.textContent = t.toFixed(2);
+          grid.appendChild(tx);
+
+          if (t !== 0) {
+            const ty = el("text", { x: x0 - 12, y: gy + 4, class: "tick tick-y" });
+            ty.textContent = t.toFixed(2);
+            grid.appendChild(ty);
+          }
+        }
+        this.svg.appendChild(grid);
+
+        // Axes (the L in the corner), tinted to match each axis colour.
+        this.svg.appendChild(el("line", { x1: x0, y1: y0, x2: x1, y2: y0, class: "axis axis-x-line" }));
+        this.svg.appendChild(el("line", { x1: x0, y1: y0, x2: x0, y2: y1, class: "axis axis-y-line" }));
+
+        // Axis titles show the chosen sentence (truncated).
+        this.xTitle = el("text", { x: (x0 + x1) / 2, y: this.H - 14, class: "axis-title axis-title-x" });
+        this.svg.appendChild(this.xTitle);
+
+        const ymid = (y0 + y1) / 2;
+        this.yTitle = el("text", {
+          x: 20,
+          y: ymid,
+          class: "axis-title axis-title-y",
+          transform: `rotate(-90 20 ${ymid})`,
+        });
+        this.svg.appendChild(this.yTitle);
+
+        this.setAxisTitles(null, null);
+
+        this.pointsLayer = el("g", { class: "points" });
+        this.svg.appendChild(this.pointsLayer);
+
+        this.empty = el("text", { x: this.px(0.5), y: this.py(0.5), class: "empty-note" });
+        this.empty.textContent = "Assign one sentence to X and one to Y";
+        this.svg.appendChild(this.empty);
+      }
+
+      /** Update the axis titles with the chosen sentences (or a placeholder). */
+      setAxisTitles(xText, yText) {
+        this.xTitle.textContent = xText ? `X · “${truncate(xText, 42)}”` : "X · choose a sentence";
+        this.yTitle.textContent = yText ? `Y · “${truncate(yText, 42)}”` : "Y · choose a sentence";
+      }
+
+      /**
+       * Render the given points.
+       * @param {{id:string,text:string,x:number,y:number,isX:boolean,isY:boolean}[]} points
+       */
+      render(points) {
+        this.empty.style.display = points.length ? "none" : "";
+
+        const seen = new Set();
+
+        for (const p of points) {
+          seen.add(p.id);
+          let g = this.nodes.get(p.id);
+          if (!g) {
+            g = el("g", { class: "pt", tabindex: "0" });
+            g.appendChild(el("circle", { r: 12, class: "pt-halo" }));
+            g.appendChild(el("circle", { r: 5.5, class: "pt-dot" }));
+            g.appendChild(el("title"));
+            this.pointsLayer.appendChild(g);
+            this.nodes.set(p.id, g);
+          }
+
+          g.setAttribute("transform", `translate(${this.px(p.x)} ${this.py(p.y)})`);
+          g.classList.toggle("is-x", !!p.isX);
+          g.classList.toggle("is-y", !!p.isY);
+          g.querySelector("title").textContent =
+            `${p.text}\n( x ${p.x.toFixed(3)},  y ${p.y.toFixed(3)} )`;
+          g.setAttribute("aria-label", `${p.text}. x ${p.x.toFixed(2)}, y ${p.y.toFixed(2)}`);
+        }
+
+        for (const [id, g] of this.nodes) {
+          if (!seen.has(id)) {
+            g.remove();
+            this.nodes.delete(id);
+          }
+        }
+      }
+    }
+  config.js: |-
+    // config.js
+    // Central knobs for the app. Edit these to point at your own embedding service.
+
+    export const CONFIG = {
+      // Your deployed embedding endpoint (AWS Lambda Function URL or API Gateway).
+      // The app POSTs { "text": "..." } and expects { "embedding": [ ...384 floats... ] }.
+      // See lambda/handler.py for a reference implementation and the exact contract.
+      EMBEDDING_ENDPOINT: "/embed",
+
+      // While true, embeddings are generated locally so the whole UI runs with no backend.
+      // The mock is deterministic (same sentence -> same vector) and unit-length, so the
+      // geometry behaves sensibly. Flip to false once EMBEDDING_ENDPOINT is live.
+      USE_MOCK: false,
+
+      // MiniLM (all-MiniLM-L6-v2) outputs 384 dimensions.
+      EMBEDDING_DIM: 384,
+
+      // Fixed seed for the orthogonal reference vector. Keeping it fixed makes the
+      // orthogonal axis reproducible across reloads for a given axis sentence.
+      ORTHO_SEED: 1337,
+    };
+  embeddings.js: |-
+    // embeddings.js
+    // Turns a sentence into a 384-dim vector, either via the remote endpoint
+    // or via a deterministic local mock (see CONFIG.USE_MOCK).
+
+    import { CONFIG } from "./config.js";
+    import { mulberry32, randomGaussianVector, normalize } from "./linalg.js";
+
+    /**
+     * Deterministic stand-in for a real embedding model.
+     * Hashes the sentence to a seed, draws a Gaussian vector, and unit-normalizes it.
+     * The same sentence always maps to the same vector, so cosine geometry is stable.
+     * NOTE: this captures none of the *meaning* of a sentence — it only lets you
+     * exercise the UI and math before a real endpoint is wired up.
+     */
+    function mockEmbedding(sentence) {
+      let h = 2166136261 >>> 0; // FNV-1a
+      for (let i = 0; i < sentence.length; i++) {
+        h ^= sentence.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      const rng = mulberry32(h >>> 0);
+      return normalize(randomGaussianVector(CONFIG.EMBEDDING_DIM, rng));
+    }
+
+    /**
+     * Get the embedding for a sentence.
+     * @returns {Promise<number[]>} a 384-length array of floats.
+     * @throws if the remote call fails or the response is malformed.
+     */
+    export async function getEmbedding(sentence) {
+      if (CONFIG.USE_MOCK) {
+        await new Promise((r) => setTimeout(r, 120)); // pretend it's a network hop
+        return mockEmbedding(sentence);
+      }
+
+      const res = await fetch(CONFIG.EMBEDDING_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: sentence }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`Embedding endpoint returned ${res.status}`);
+      }
+
+      const data = await res.json();
+      let emb = data.embedding;
+      // Some servers return a batch, i.e. shape (1, 384) -> [[...]]. Flatten to a vector.
+      if (Array.isArray(emb) && emb.length === 1 && Array.isArray(emb[0])) {
+        emb = emb[0];
+      }
+      if (!Array.isArray(emb) || emb.length === 0 || typeof emb[0] !== "number") {
+        throw new Error("Response 'embedding' was not a flat numeric array");
+      }
+      if (emb.length !== CONFIG.EMBEDDING_DIM) {
+        console.warn(`Expected ${CONFIG.EMBEDDING_DIM} dims, got ${emb.length}.`);
+      }
+      return emb;
+    }
+  index.html: |-
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Semantic Axes — a sentence plotting instrument</title>
+        <meta
+          name="description"
+          content="Plot sentences by their embedding similarity to two sentences you choose as the X and Y axes."
+        />
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+        <link
+          href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;700&display=swap"
+          rel="stylesheet"
+        />
+        <link rel="stylesheet" href="styles.css" />
+      </head>
+      <body>
+        <div class="app">
+          <!-- Top bar -->
+          <header class="topbar">
+            <div class="brand">
+              <span class="brand-mark" aria-hidden="true"></span>
+              <span class="brand-name">Semantic&nbsp;Axes</span>
+              <span class="brand-sub">sentence plotting instrument</span>
+            </div>
+            <div class="topbar-right">
+              <dl class="readout" aria-label="Instrument status">
+                <div class="readout-item">
+                  <dt>dim</dt>
+                  <dd id="dim">384</dd>
+                </div>
+                <div class="readout-item">
+                  <dt>source</dt>
+                  <dd id="mode">MOCK</dd>
+                </div>
+                <div class="readout-item">
+                  <dt>n</dt>
+                  <dd id="count">0</dd>
+                </div>
+              </dl>
+              <a
+                class="gh-link"
+                href="https://github.com/ziHanDing579/embed-visual"
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label="View source on GitHub"
+                title="View source on GitHub"
+              >
+                <svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true">
+                  <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path>
+                </svg>
+                <span class="gh-text">GitHub</span>
+              </a>
+            </div>
+          </header>
+
+          <!-- Left rail: captured sentences -->
+          <aside class="rail" aria-label="Captured sentences">
+            <div class="rail-head">
+              <h2 class="rail-title">Captured</h2>
+              <p class="rail-hint">Assign one sentence to X and one to Y</p>
+            </div>
+            <div id="sentence-list" class="rail-list" role="list"></div>
+          </aside>
+
+          <!-- Main: the plate + input -->
+          <main class="stage">
+            <div id="axis-readout" class="axis-readout">
+              <span class="ar-pair">
+                <span class="ar-badge ar-x">X</span>
+                <span class="ar-text unset" id="x-text">choose a sentence</span>
+              </span>
+              <span class="ar-pair">
+                <span class="ar-badge ar-y">Y</span>
+                <span class="ar-text unset" id="y-text">choose a sentence</span>
+              </span>
+            </div>
+
+            <figure class="plate">
+              <svg id="plot" class="plot"></svg>
+              <figcaption class="legend">
+                <span class="legend-item"><i class="swatch swatch-x"></i>X axis</span>
+                <span class="legend-item"><i class="swatch swatch-y"></i>Y axis</span>
+                <span class="legend-item"><i class="swatch swatch-point"></i>plotted sentence</span>
+              </figcaption>
+            </figure>
+
+            <form id="capture-form" class="capture" autocomplete="off">
+              <input
+                id="sentence-input"
+                class="capture-input"
+                type="text"
+                placeholder="Type a sentence and press Enter"
+                aria-label="Sentence to plot"
+              />
+              <button id="submit-btn" class="capture-btn" type="submit">Plot</button>
+            </form>
+            <p id="status" class="status" role="status" aria-live="polite"></p>
+          </main>
+        </div>
+
+        <script type="module" src="app.js"></script>
+      </body>
+    </html>
+  linalg.js: |-
+    // linalg.js
+    // Small, dependency-free vector math for embeddings.
+
+    /** Dot product of two equal-length vectors. */
+    export function dot(a, b) {
+      let s = 0;
+      for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+      return s;
+    }
+
+    /** Euclidean (L2) norm. */
+    export function norm(a) {
+      return Math.sqrt(dot(a, a));
+    }
+
+    /** Return a unit-length copy of `a`. Zero vectors are returned unchanged. */
+    export function normalize(a) {
+      const n = norm(a);
+      if (n === 0) return a.slice();
+      return a.map((v) => v / n);
+    }
+
+    /**
+     * Cosine similarity in [-1, 1]. Robust to non-unit inputs.
+     * Returns 0 if either vector is all zeros.
+     */
+    export function cosineSimilarity(a, b) {
+      const denom = norm(a) * norm(b);
+      if (denom === 0) return 0;
+      return dot(a, b) / denom;
+    }
+
+    /** Clamp to the first-quadrant range [0, 1]. */
+    export function clamp01(x) {
+      return Math.max(0, Math.min(1, x));
+    }
+
+    /**
+     * mulberry32 PRNG. Deterministic given a 32-bit seed.
+     * Returns a function producing floats in [0, 1). Used by the local mock.
+     */
+    export function mulberry32(seed) {
+      let a = seed >>> 0;
+      return function () {
+        a |= 0;
+        a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    /**
+     * A vector of `dim` samples from a standard normal, using the supplied rng
+     * (a function returning floats in [0,1)). Box–Muller transform. Used by the mock.
+     */
+    export function randomGaussianVector(dim, rng) {
+      const out = new Array(dim);
+      for (let i = 0; i < dim; i += 2) {
+        let u1 = rng();
+        const u2 = rng();
+        if (u1 < 1e-12) u1 = 1e-12; // avoid log(0)
+        const r = Math.sqrt(-2 * Math.log(u1));
+        const theta = 2 * Math.PI * u2;
+        out[i] = r * Math.cos(theta);
+        if (i + 1 < dim) out[i + 1] = r * Math.sin(theta);
+      }
+      return out;
+    }
+  styles.css: |-
+    /* styles.css — "plotting instrument" theme
+       Dark indigo chassis housing a light graph-paper plate.
+       Two axis colours: teal = X axis sentence, amber = Y axis sentence. */
+
+    :root {
+      /* chassis */
+      --chassis: #14122a;
+      --chassis-raised: #1d1a3a;
+      --chassis-line: #2c2850;
+      /* plate (the light plotting surface) */
+      --plate: #e8edf1;
+      --plate-line: rgba(43, 62, 88, 0.16);
+      --plate-edge: rgba(43, 62, 88, 0.35);
+      --ink: #161d2b;
+      --ink-soft: #55607a;
+      /* chassis text */
+      --text: #e0e4ef;
+      --muted: #8a90ab;
+      /* data */
+      --accent: #f2a63a; /* amber — Y axis + primary UI accent */
+      --accent-ink: #140f02;
+      --axis-x: #0e9aa7; /* teal — X axis */
+      --axis-x-ink: #04191b;
+      --point: #515c86; /* slate — plotted (non-axis) sentences */
+      --danger: #ff7a7a;
+
+      --font-display: "Space Grotesk", system-ui, -apple-system, "Segoe UI", sans-serif;
+      --font-data: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+      --radius: 12px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      height: 100%;
+      margin: 0;
+    }
+
+    body {
+      background: radial-gradient(120% 120% at 15% 0%, #1a1738 0%, var(--chassis) 55%);
+      color: var(--text);
+      font-family: var(--font-display);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ---- App grid ---- */
+    .app {
+      display: grid;
+      grid-template-columns: 312px 1fr;
+      grid-template-rows: auto 1fr;
+      grid-template-areas:
+        "top  top"
+        "rail stage";
+      height: 100vh;
+      min-height: 0;
+    }
+
+    /* ---- Top bar ---- */
+    .topbar {
+      grid-area: top;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 22px;
+      border-bottom: 1px solid var(--chassis-line);
+    }
+
+    .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+    }
+
+    .brand-mark {
+      align-self: center;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 4px rgba(242, 166, 58, 0.16), 0 0 16px rgba(242, 166, 58, 0.5);
+    }
+
+    .brand-name {
+      font-weight: 700;
+      font-size: 19px;
+      letter-spacing: 0.01em;
+    }
+
+    .brand-sub {
+      font-family: var(--font-data);
+      font-size: 11px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .readout {
+      display: flex;
+      gap: 8px;
+      margin: 0;
+    }
+
+    .readout-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      padding: 6px 14px;
+      border: 1px solid var(--chassis-line);
+      border-radius: 8px;
+      background: var(--chassis-raised);
+    }
+
+    .readout-item dt {
+      font-family: var(--font-data);
+      font-size: 9px;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .readout-item dd {
+      margin: 0;
+      font-family: var(--font-data);
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--accent);
+    }
+
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .gh-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 14px;
+      border: 1px solid var(--chassis-line);
+      border-radius: 8px;
+      background: var(--chassis-raised);
+      color: var(--text);
+      text-decoration: none;
+      font-family: var(--font-data);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      transition: border-color 0.15s ease, color 0.15s ease, transform 0.08s ease;
+    }
+    .gh-link:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .gh-link:active {
+      transform: translateY(1px);
+    }
+    .gh-link:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .gh-link svg {
+      display: block;
+    }
+
+    /* ---- Rail ---- */
+    .rail {
+      grid-area: rail;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      border-right: 1px solid var(--chassis-line);
+    }
+
+    .rail-head {
+      padding: 18px 20px 12px;
+    }
+
+    .rail-title {
+      margin: 0;
+      font-size: 13px;
+      font-family: var(--font-data);
+      font-weight: 500;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: var(--text);
+    }
+
+    .rail-hint {
+      margin: 6px 0 0;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .rail-list {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 4px 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--chassis-line) transparent;
+    }
+
+    .rail-list::-webkit-scrollbar {
+      width: 8px;
+    }
+    .rail-list::-webkit-scrollbar-thumb {
+      background: var(--chassis-line);
+      border-radius: 8px;
+    }
+
+    /* rows */
+    .row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 6px 10px;
+      align-items: center;
+      padding: 10px 12px;
+      border: 1px solid var(--chassis-line);
+      border-radius: 9px;
+      background: var(--chassis-raised);
+      color: var(--text);
+      transition: border-color 0.15s ease;
+    }
+
+    .row-text {
+      grid-column: 1 / -1;
+      font-size: 14px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
+
+    .row-coord {
+      grid-column: 1;
+      align-self: center;
+      font-family: var(--font-data);
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .row-actions {
+      grid-column: 2;
+      display: flex;
+      gap: 6px;
+    }
+
+    .ax-btn {
+      width: 30px;
+      height: 26px;
+      border-radius: 6px;
+      border: 1px solid var(--chassis-line);
+      background: transparent;
+      color: var(--muted);
+      font-family: var(--font-data);
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease, transform 0.08s ease;
+    }
+    .ax-btn:hover {
+      color: var(--text);
+      border-color: #3b3670;
+    }
+    .ax-btn:active {
+      transform: translateY(1px);
+    }
+    .ax-btn:focus-visible {
+      outline: 2px solid var(--text);
+      outline-offset: 2px;
+    }
+    .ax-x.active {
+      background: var(--axis-x);
+      border-color: var(--axis-x);
+      color: var(--axis-x-ink);
+    }
+    .ax-y.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--accent-ink);
+    }
+
+    .row.is-x {
+      border-color: var(--axis-x);
+    }
+    .row.is-y {
+      border-color: var(--accent);
+    }
+
+    /* ---- Stage ---- */
+    .stage {
+      grid-area: stage;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      padding: 18px 22px 22px;
+      gap: 14px;
+    }
+
+    .axis-readout {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 22px;
+      align-items: center;
+      min-height: 26px;
+      font-size: 15px;
+    }
+
+    .ar-pair {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      min-width: 0;
+    }
+
+    .ar-badge {
+      font-family: var(--font-data);
+      font-size: 11px;
+      font-weight: 500;
+      padding: 3px 8px;
+      border-radius: 5px;
+    }
+    .ar-x {
+      color: var(--axis-x-ink);
+      background: var(--axis-x);
+    }
+    .ar-y {
+      color: var(--accent-ink);
+      background: var(--accent);
+    }
+
+    .ar-text {
+      overflow-wrap: anywhere;
+    }
+    .ar-text::before {
+      content: "\201C";
+      color: var(--muted);
+    }
+    .ar-text::after {
+      content: "\201D";
+      color: var(--muted);
+    }
+    .ar-text.unset {
+      color: var(--muted);
+      font-style: italic;
+    }
+    .ar-text.unset::before,
+    .ar-text.unset::after {
+      content: "";
+    }
+
+    /* the plate */
+    .plate {
+      flex: 1;
+      min-height: 0;
+      margin: 0;
+      padding: 14px 14px 8px;
+      border: 1px solid var(--chassis-line);
+      border-radius: var(--radius);
+      background: var(--plate);
+      box-shadow: inset 0 2px 10px rgba(0, 0, 0, 0.22), 0 1px 0 rgba(255, 255, 255, 0.04);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .plot {
+      flex: 1;
+      min-height: 0;
+      width: 100%;
+      display: block;
+    }
+
+    /* svg plate internals */
+    .plate-bg {
+      fill: transparent;
+    }
+    .gridline {
+      stroke: var(--plate-line);
+      stroke-width: 1;
+    }
+    .axis {
+      stroke: var(--plate-edge);
+      stroke-width: 1.5;
+    }
+    .axis-x-line {
+      stroke: var(--axis-x);
+      opacity: 0.55;
+    }
+    .axis-y-line {
+      stroke: var(--accent);
+      opacity: 0.7;
+    }
+    .tick {
+      fill: var(--ink-soft);
+      font-family: var(--font-data);
+      font-size: 11px;
+      text-anchor: middle;
+    }
+    .tick-y {
+      text-anchor: end;
+    }
+    .axis-title {
+      font-family: var(--font-data);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-anchor: middle;
+    }
+    .axis-title-x {
+      fill: #0b6b74;
+    }
+    .axis-title-y {
+      fill: #9a6510;
+    }
+    .empty-note {
+      fill: var(--ink-soft);
+      font-family: var(--font-display);
+      font-size: 15px;
+      text-anchor: middle;
+      opacity: 0.7;
+    }
+
+    /* points */
+    .pt {
+      cursor: default;
+      transition: transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .pt-dot {
+      fill: var(--point);
+      stroke: var(--plate);
+      stroke-width: 1.5;
+      transition: fill 0.3s ease;
+    }
+    .pt-halo {
+      fill: var(--point);
+      opacity: 0;
+      transition: opacity 0.2s ease;
+    }
+    .pt:hover .pt-halo,
+    .pt:focus-visible .pt-halo {
+      opacity: 0.16;
+    }
+    .pt:focus-visible {
+      outline: none;
+    }
+    .pt:focus-visible .pt-dot {
+      stroke: var(--ink);
+    }
+    /* X axis point (teal). Y rule comes after so it wins if a sentence is both. */
+    .pt.is-x .pt-dot {
+      fill: var(--axis-x);
+      r: 7;
+      stroke-width: 2;
+    }
+    .pt.is-x .pt-halo {
+      fill: var(--axis-x);
+      opacity: 0.22;
+    }
+    .pt.is-y .pt-dot {
+      fill: var(--accent);
+      r: 7;
+      stroke-width: 2;
+    }
+    .pt.is-y .pt-halo {
+      fill: var(--accent);
+      opacity: 0.22;
+    }
+
+    @keyframes pop-in {
+      from {
+        opacity: 0;
+      }
+      to {
+        opacity: 1;
+      }
+    }
+    .points .pt {
+      animation: pop-in 0.28s ease both;
+    }
+
+    /* legend */
+    .legend {
+      display: flex;
+      gap: 18px;
+      padding: 4px 6px 2px;
+      font-family: var(--font-data);
+      font-size: 11px;
+      color: var(--ink-soft);
+    }
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .swatch-x {
+      background: var(--axis-x);
+    }
+    .swatch-y {
+      background: var(--accent);
+    }
+    .swatch-point {
+      background: var(--point);
+    }
+
+    /* ---- Capture input ---- */
+    .capture {
+      display: flex;
+      gap: 10px;
+    }
+
+    .capture-input {
+      flex: 1;
+      padding: 13px 16px;
+      border-radius: 10px;
+      border: 1px solid var(--chassis-line);
+      background: var(--chassis-raised);
+      color: var(--text);
+      font-family: var(--font-display);
+      font-size: 15px;
+    }
+    .capture-input::placeholder {
+      color: var(--muted);
+    }
+    .capture-input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(242, 166, 58, 0.16);
+    }
+    .capture-input:disabled {
+      opacity: 0.6;
+    }
+
+    .capture-btn {
+      padding: 0 24px;
+      border: none;
+      border-radius: 10px;
+      background: var(--accent);
+      color: var(--accent-ink);
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 15px;
+      letter-spacing: 0.02em;
+      cursor: pointer;
+      transition: filter 0.15s ease, transform 0.08s ease;
+    }
+    .capture-btn:hover {
+      filter: brightness(1.06);
+    }
+    .capture-btn:active {
+      transform: translateY(1px);
+    }
+    .capture-btn:disabled {
+      filter: saturate(0.4) brightness(0.8);
+      cursor: default;
+    }
+    .capture-btn:focus-visible {
+      outline: 2px solid var(--text);
+      outline-offset: 2px;
+    }
+
+    .status {
+      margin: 0;
+      min-height: 18px;
+      font-family: var(--font-data);
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .status.is-error {
+      color: var(--danger);
+    }
+
+    /* ---- Responsive ---- */
+    @media (max-width: 860px) {
+      .app {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto 1fr auto;
+        grid-template-areas:
+          "top"
+          "stage"
+          "rail";
+        height: auto;
+        min-height: 100vh;
+      }
+      .rail {
+        border-right: none;
+        border-top: 1px solid var(--chassis-line);
+        max-height: 40vh;
+      }
+      .stage {
+        min-height: 62vh;
+      }
+      .readout-item {
+        padding: 5px 10px;
+      }
+      .brand-sub,
+      .gh-text {
+        display: none;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .pt,
+      .pt-dot,
+      .pt-halo,
+      .points .pt {
+        transition: none;
+        animation: none;
+      }
+    }
+kind: ConfigMap
+metadata:
+  name: frontend-static

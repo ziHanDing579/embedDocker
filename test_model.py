@@ -1,8 +1,9 @@
-from app import encode
+from model import encode
 import pytest
 import numpy as np
 
 target_dims = 384
+model.load()  # Ensure the model is loaded before running tests
 
 def _cosine_similarity(a, b):
     a_norm = a / np.linalg.norm(a, axis=1, keepdims=True)

@@ -1,12 +1,28 @@
-FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12
+FROM python:3.12-slim
 
-COPY requirements.txt ${LAMBDA_TASK_ROOT}/
-RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+# Unbuffered stdout: Python buffers when stdout isn't a TTY, so your logs
+# would reach `kubectl logs` in delayed chunks, or not at all if the
+# container dies with the buffer unflushed.
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-COPY model/onnx/model.onnx ${LAMBDA_TASK_ROOT}/model/onnx/
-COPY model/tokenizer.json ${LAMBDA_TASK_ROOT}/model/
-COPY app.py         ${LAMBDA_TASK_ROOT}/
-COPY otel_setup.py  ${LAMBDA_TASK_ROOT}/
+WORKDIR /app
 
-# LAMBDA_TASK_ROOT is /var/task; the handler is module.function
-CMD [ "app.handler" ]
+# Dependencies before code. This layer is ~2.5 GB and changes rarely;
+# copying source first would invalidate it on every edit.
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+# Only the two files model.py actually opens.
+COPY model/tokenizer.json   model/tokenizer.json
+COPY model/onnx/model.onnx  model/onnx/model.onnx
+COPY otel_setup.py model.py main.py ./
+
+ENV MODEL_DIR=/app/model
+
+RUN useradd -m -u 1000 app && chown -R app:app /app
+USER app
+
+EXPOSE 8080
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

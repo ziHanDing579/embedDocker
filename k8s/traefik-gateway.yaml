@@ -1,0 +1,13 @@
+# k8s/traefik-gateway-provider.yaml
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik            # must match the HelmChart k3s created
+  namespace: kube-system   # must be where that HelmChart lives
+spec:
+  valuesContent: |-
+    providers:
+      kubernetesGateway:
+        enabled: true
+    gateway:
+      enabled: false

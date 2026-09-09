@@ -1,0 +1,13 @@
+# k8s/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: embed-api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: embed-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

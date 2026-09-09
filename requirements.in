@@ -1,4 +1,6 @@
-onnxruntime >= 1.28
+onnxruntime-gpu[cuda,cudnn] >= 1.28.0
+fastapi
+uvicorn[standard]
 tokenizers >= 0.22
 numpy >= 2.5
 opentelemetry-api

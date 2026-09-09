@@ -1,0 +1,9 @@
+.git
+modelEnv
+devEnv
+__pycache__
+*.pyc
+.pytest_cache
+model/
+!model/tokenizer.json
+!model/onnx/model.onnx
