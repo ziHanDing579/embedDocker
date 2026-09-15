@@ -7,6 +7,11 @@ on:
     # the workflow silently never runs rather than failing loudly.
     branches: ["k8s-build"]
   workflow_dispatch:
+    inputs:
+      gpu_runner:
+        description: "Label of a self-hosted runner with an NVIDIA GPU (e.g. the k3s box). Blank = skip the GPU job."
+        required: false
+        default: ""
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -47,7 +52,7 @@ jobs:
       # kubectl ships kustomize v5, so there's nothing extra to install.
       - name: Validate manifests
         run: |
-          for dir in k8s k8s/ci; do
+          for dir in k8s k8s-ci; do
             echo "== $dir =="
             kubectl kustomize "$dir" | kubeconform -strict -summary -verbose \
               -ignore-missing-schemas \
@@ -179,6 +184,69 @@ jobs:
       - name: Smoke test
         run: bash ./smoke_test.sh "$IMAGE_LOCAL"
 
+      # ---- GPU capability, verified without a GPU -------------------------
+      # This runner has no driver, so the CUDA provider can't be *exercised*.
+      # It can be proven *present*: if a dependency change ever swapped
+      # onnxruntime-gpu for the CPU wheel, these files would vanish and the
+      # CPU-only tests below would still pass happily. That's the failure
+      # this step exists to catch.
+      - name: CUDA execution provider is packaged
+        run: |
+          docker run --rm --entrypoint python "$IMAGE_LOCAL" -c '
+          import glob, os, onnxruntime as ort
+          capi = os.path.join(os.path.dirname(ort.__file__), "capi")
+          site = os.path.dirname(os.path.dirname(ort.__file__))
+
+          # Diagnostic only. Whether a driverless host lists the CUDA EP here
+          # varies by ORT version, so it is printed, not asserted.
+          print("ORT", ort.__version__, "providers:", ort.get_available_providers())
+
+          required = {
+              "CUDA execution provider": f"{capi}/libonnxruntime_providers_cuda.so",
+              "cuDNN":  f"{site}/nvidia/cudnn/lib/libcudnn.so*",
+              "cuBLAS": f"{site}/nvidia/cublas/lib/libcublas.so*",
+          }
+          missing = [n for n, pat in required.items() if not glob.glob(pat)]
+          for name, pat in required.items():
+              print(("  ok   " if glob.glob(pat) else "  MISS ") + name)
+          if missing:
+              raise SystemExit("not a GPU-capable image, missing: " + ", ".join(missing))
+          '
+
+      # The counterpart: prove the guard in model.load() is load-bearing. With
+      # REQUIRE_GPU=1 and no device, the container must die rather than serve
+      # CPU results under a GPU-shaped deployment. If this ever starts passing
+      # silently on a runner, the production manifest's REQUIRE_GPU=1 means
+      # nothing.
+      - name: REQUIRE_GPU=1 fails closed
+        run: |
+          docker run -d --name gpu-guard \
+            -e REQUIRE_GPU=1 \
+            -e ORT_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider \
+            "$IMAGE_LOCAL" >/dev/null
+
+          code=$(timeout 240 docker wait gpu-guard || echo timeout)
+          logs=$(docker logs gpu-guard 2>&1 || true)
+          docker rm -f gpu-guard >/dev/null 2>&1 || true
+
+          echo "$logs" | tail -20
+          [ "$code" != "0" ] && [ "$code" != "timeout" ] \
+            || { echo "FAIL: container exited ${code}; it should refuse to start"; exit 1; }
+          echo "$logs" | grep -q 'REQUIRE_GPU=1 but session providers are' \
+            || { echo "FAIL: exited ${code}, but not via the REQUIRE_GPU guard"; exit 1; }
+          echo "PASS: refused to start without CUDA (exit ${code})"
+
+      - name: Record what was and wasn't proven
+        if: always()
+        run: |
+          {
+            echo "### GPU coverage"
+            echo "- CUDA EP, cuDNN and cuBLAS present in the image: verified"
+            echo "- \`REQUIRE_GPU=1\` refuses to serve without a device: verified"
+            echo "- Inference on an actual GPU: **not covered here** — run this"
+            echo "  workflow manually with a \`gpu_runner\` label for that."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # ---- Kubernetes, for real ------------------------------------------
       # Same job as the build on purpose: the image is already in this
       # runner's docker daemon. Shipping several GB of nvidia wheels to a
@@ -212,7 +280,7 @@ jobs:
             --from-literal=GRAFANA_OTLP_TOKEN=ci
 
       - name: Apply manifests
-        run: kubectl apply -k k8s/ci
+        run: kubectl apply -k k8s-ci
 
       - name: Wait for rollout
         # This is the real assertion. rollout status only returns 0 once the
@@ -283,3 +351,62 @@ jobs:
           kubectl logs -l app.kubernetes.io/name=embed-api --tail=200 --all-containers || true
           kubectl -n observability logs deploy/otel-collector --tail=100 || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -40
+
+  # --------------------------------------------------------------------------
+  # The actual GPU proof. Opt-in: only runs when you trigger the workflow by
+  # hand and pass a runner label, so a normal push never waits on hardware.
+  #
+  # Deliberately no "free disk space" step here -- that one deletes host
+  # directories, which is fine on a throwaway GitHub runner and very much not
+  # fine on your own machine.
+  # --------------------------------------------------------------------------
+  gpu:
+    name: GPU inference (self-hosted)
+    if: github.event_name == 'workflow_dispatch' && inputs.gpu_runner != ''
+    needs: model
+    runs-on: ${{ inputs.gpu_runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the device
+        run: nvidia-smi
+
+      - name: Download model
+        uses: actions/download-artifact@v4
+        with:
+          name: onnx-model
+          path: model
+
+      - name: Build image
+        run: docker build -f ./dockerfile -t embed-api:gpu .
+
+      # REQUIRE_GPU=1 with no provider override: exactly what deployment.yaml
+      # asks for. If CUDA doesn't come up, load() raises and this never goes
+      # ready -- same guard the CPU job proved fires.
+      - name: Serve on the GPU
+        run: |
+          docker run -d --name embed-gpu --gpus all -p 18090:8080 \
+            -e REQUIRE_GPU=1 embed-api:gpu >/dev/null
+
+          for _ in $(seq 60); do
+            curl -fsS localhost:18090/readyz >/dev/null 2>&1 && break
+            sleep 2
+          done
+
+          ready=$(curl -fsS localhost:18090/readyz)
+          echo "$ready"
+          echo "$ready" | grep -q CUDAExecutionProvider \
+            || { echo "FAIL: session is not on CUDA"; exit 1; }
+
+          dims=$(curl -fsS -XPOST localhost:18090/embed \
+                   -H 'Content-Type: application/json' \
+                   -d '{"text": "hello world"}' | jq '.embedding | flatten | length')
+          [ "$dims" = "384" ] || { echo "FAIL: got ${dims} dims"; exit 1; }
+
+          echo "PASS: CUDA session, 384 dims" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker logs embed-gpu 2>&1 | tail -30 || true
+          docker rm -f embed-gpu >/dev/null 2>&1 || true

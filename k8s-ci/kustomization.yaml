@@ -1,4 +1,4 @@
-# k8s/ci/kustomization.yaml
+# k8s-ci/kustomization.yaml
 #
 # The same manifests, minus the things a GitHub runner can't provide.
 # Everything else -- probes, Services, routes, the collector, the frontend
@@ -6,8 +6,10 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+# Sibling of k8s/, not a child. Kustomize treats a base that contains the
+# overlay directory as a cycle, so k8s/ci/ can never build on k8s/.
 resources:
-  - ../
+  - ../k8s
 
 # deployment.yaml pins embed-api:0.1.0; CI builds embed-api:ci and side-loads
 # it into the kind node. imagePullPolicy stays Never either way.
