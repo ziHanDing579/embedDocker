@@ -1,0 +1,9 @@
+# Just enough to run export.py. Deliberately does NOT pull in requirements.in:
+# the export runs on CPU in CI and never touches onnxruntime-gpu or the CUDA
+# toolkit, which is ~6 GB of the requirements-dev lock.
+#
+# Install torch from the CPU index first, then this file:
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   pip install -r requirements-export.in
+sentence-transformers>=4.0.0
+optimum[onnxruntime]
