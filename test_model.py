@@ -39,6 +39,16 @@ def _cosine_similarity(a, b):
     return np.dot(a_norm, b_norm.T)
 
 
+def _pair_similarity(a, b):
+    """Scalar similarity between two single-sentence encodings.
+
+    encode() returns shape (1, 384), so the matrix above is (1, 1). NumPy 2
+    refuses float() on anything with ndim > 0 -- only genuine 0-d arrays --
+    so unwrap with .item() instead.
+    """
+    return _cosine_similarity(a, b).item()
+
+
 def test_providers_reported_after_load():
     assert model.providers(), "session reported no execution providers"
 
@@ -85,7 +95,7 @@ def test_identical_inputs():
 def test_similar_inputs():
     a = model.encode("The man plays the guitar.")
     b = model.encode("The man is playing a string instrument.")
-    similarity = float(_cosine_similarity(a, b))
+    similarity = _pair_similarity(a, b)
     assert similarity > 0.7, f"expected high similarity, got {similarity}"
 
 
@@ -95,6 +105,6 @@ def test_unrelated_inputs_are_further_apart():
     anchor = model.encode("The man plays the guitar.")
     near = model.encode("The man is playing a string instrument.")
     far = model.encode("Quarterly revenue exceeded analyst expectations.")
-    assert float(_cosine_similarity(anchor, far)) < float(
-        _cosine_similarity(anchor, near)
-    )
+    far_sim = _pair_similarity(anchor, far)
+    near_sim = _pair_similarity(anchor, near)
+    assert far_sim < near_sim, f"unrelated {far_sim:.3f} >= paraphrase {near_sim:.3f}"
