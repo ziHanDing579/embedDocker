@@ -1,0 +1,285 @@
+name: CI
+
+on:
+  push:
+    # The k3s work lives here and isn't headed for main. Change this string
+    # if your branch is named something other than `k8s` -- a mismatch means
+    # the workflow silently never runs rather than failing loudly.
+    branches: ["k8s-build"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_LOCAL: embed-api:ci
+  # Bump when you move to a newer Gateway API release.
+  GATEWAY_API_VERSION: v1.2.1
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Static checks on the Kubernetes manifests. No cluster, no network to a
+  # kube-apiserver -- kubeconform validates against published JSON schemas.
+  # --------------------------------------------------------------------------
+  manifests:
+    name: Manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kubeconform
+        run: |
+          curl -sSfL -o /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          sudo tar -xzf /tmp/kubeconform.tar.gz -C /usr/local/bin kubeconform
+          kubeconform -v
+
+      # Validate what kustomize actually renders, not the raw files: that way
+      # the overlay's patches are checked too, and a bad JSON-6902 path fails
+      # here instead of 10 minutes later in the cluster.
+      #
+      # -ignore-missing-schemas lets k3s-only kinds through (HelmChartConfig);
+      # the CRDs-catalog location covers Gateway / HTTPRoute properly.
+      # kubectl ships kustomize v5, so there's nothing extra to install.
+      - name: Validate manifests
+        run: |
+          for dir in k8s k8s/ci; do
+            echo "== $dir =="
+            kubectl kustomize "$dir" | kubeconform -strict -summary -verbose \
+              -ignore-missing-schemas \
+              -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+          done
+
+  # --------------------------------------------------------------------------
+  # Export the ONNX model once, cache it, hand it to the jobs that need it.
+  # CPU-only torch here: the full requirements-dev lock drags in the CUDA
+  # toolkit (~6 GB) that the export itself never touches.
+  # --------------------------------------------------------------------------
+  model:
+    name: Export model
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-export.in
+
+      - name: Restore exported model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: model/
+          key: model-${{ hashFiles('export.py', 'requirements-export.in') }}
+
+      - name: Install export dependencies
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -r requirements-export.in
+
+      - name: Export model
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: python export.py
+
+      - name: Verify model files
+        run: |
+          test -f model/tokenizer.json
+          test -f model/onnx/model.onnx
+          ls -lh model/ model/onnx/
+
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnx-model
+          # Exactly the two files the Dockerfile copies.
+          path: |
+            model/tokenizer.json
+            model/onnx/model.onnx
+          retention-days: 1
+
+  # --------------------------------------------------------------------------
+  # Unit tests. Runtime deps only (no torch, no sentence-transformers).
+  # --------------------------------------------------------------------------
+  test:
+    name: Unit tests
+    needs: model
+    runs-on: ubuntu-latest
+    env:
+      MODEL_DIR: model
+      REQUIRE_GPU: "0"
+      ORT_PROVIDERS: CPUExecutionProvider
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Download model
+        uses: actions/download-artifact@v4
+        with:
+          name: onnx-model
+          path: model
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest httpx
+
+      - name: Run tests
+        run: pytest -v
+
+  # --------------------------------------------------------------------------
+  # Build the real image and prove the container serves. No GPU: the image is
+  # GPU-capable but ORT_PROVIDERS pins it to CPU for the smoke test.
+  # --------------------------------------------------------------------------
+  image:
+    name: Build, smoke test, run on kind
+    needs: [model, test, manifests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        # The onnxruntime-gpu image is several GB of nvidia wheels.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Download model
+        uses: actions/download-artifact@v4
+        with:
+          name: onnx-model
+          path: model
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./dockerfile
+          load: true
+          tags: ${{ env.IMAGE_LOCAL }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: bash ./smoke_test.sh "$IMAGE_LOCAL"
+
+      # ---- Kubernetes, for real ------------------------------------------
+      # Same job as the build on purpose: the image is already in this
+      # runner's docker daemon. Shipping several GB of nvidia wheels to a
+      # separate job as an artifact would cost more than the build did.
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ci
+
+      - name: Load image into kind
+        # imagePullPolicy is Never, so the image has to be side-loaded into
+        # the node's containerd. No registry involved.
+        run: kind load docker-image "$IMAGE_LOCAL" --name ci
+
+      - name: Install Gateway API CRDs
+        # There's no controller behind them here, so the Gateway and both
+        # HTTPRoutes stay unreconciled -- but they apply exactly as written,
+        # which is what catches a bad parentRef or sectionName.
+        run: |
+          kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
+
+      - name: Placeholder collector credentials
+        # basicauth/grafana is listed in service.extensions, so the collector
+        # refuses to start without these. Nothing ever dials out: both
+        # pipelines export to `debug` only.
+        run: |
+          kubectl create namespace observability --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n observability create secret generic grafana-otlp \
+            --from-literal=GRAFANA_OTLP_ENDPOINT=http://127.0.0.1:1 \
+            --from-literal=GRAFANA_INSTANCE_ID=ci \
+            --from-literal=GRAFANA_OTLP_TOKEN=ci
+
+      - name: Apply manifests
+        run: kubectl apply -k k8s/ci
+
+      - name: Wait for rollout
+        # This is the real assertion. rollout status only returns 0 once the
+        # readiness probes pass, which means /readyz answered 200, which means
+        # model.load() finished inside the cluster.
+        run: |
+          kubectl -n observability rollout status deploy/otel-collector --timeout=180s
+          kubectl rollout status deploy/embed-api --timeout=360s
+          kubectl rollout status deploy/frontend  --timeout=120s
+
+      - name: Verify the API through its Service
+        run: |
+          kubectl port-forward svc/embed-api 18080:80 >/tmp/pf-api.log 2>&1 &
+          for _ in $(seq 30); do
+            curl -fsS localhost:18080/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+          echo "readyz: $(curl -fsS localhost:18080/readyz)"
+
+          # encode() returns (N, 384), so a single string comes back nested.
+          dims=$(curl -fsS -XPOST localhost:18080/embed \
+                   -H 'Content-Type: application/json' \
+                   -d '{"text": "hello world"}' | jq '.embedding | flatten | length')
+          [ "$dims" = "384" ] || { echo "FAIL: got ${dims} dims"; exit 1; }
+          echo "PASS: /embed -> 384 dims"
+
+          rows=$(curl -fsS -XPOST localhost:18080/embed \
+                   -H 'Content-Type: application/json' \
+                   -d '{"text": ["one", "two", "three"]}' | jq '.embedding | length')
+          [ "$rows" = "3" ] || { echo "FAIL: batch returned ${rows} rows"; exit 1; }
+          echo "PASS: batch of 3 -> 3 vectors"
+
+      - name: Verify the frontend ConfigMap is served
+        run: |
+          kubectl port-forward svc/frontend 18081:80 >/tmp/pf-fe.log 2>&1 &
+          for _ in $(seq 30); do
+            curl -fsS localhost:18081/index.html >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS localhost:18081/index.html | grep -q 'Semantic' \
+            || { echo "FAIL: index.html not served"; exit 1; }
+          curl -fsS localhost:18081/app.js >/dev/null \
+            || { echo "FAIL: app.js missing from the generated ConfigMap"; exit 1; }
+          echo "PASS: static assets served from frontend-static"
+
+      - name: Verify telemetry reached the collector
+        # Closes the loop on otel_setup: the span the handler opened made it
+        # through the OTLP hop and the k8sattributes processor. batch.timeout
+        # is 5s, hence the wait.
+        run: |
+          for _ in $(seq 12); do
+            if kubectl -n observability logs deploy/otel-collector --tail=-1 \
+                 | grep -q 'embed.request'; then
+              echo "PASS: collector received the embed.request span"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "FAIL: no embed.request span in the collector logs"
+          kubectl -n observability logs deploy/otel-collector --tail=100
+          exit 1
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get all -A
+          kubectl describe pods -l app.kubernetes.io/name=embed-api
+          kubectl logs -l app.kubernetes.io/name=embed-api --tail=200 --all-containers || true
+          kubectl -n observability logs deploy/otel-collector --tail=100 || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -40

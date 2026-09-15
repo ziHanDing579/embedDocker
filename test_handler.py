@@ -1,103 +1,134 @@
-"""Unit tests for the Lambda app handler.
+"""Tests for the FastAPI app in main.py.
 
-These test the handler's request/response logic only -- event parsing,
-response shape, and error handling. The embedding model is mocked (it's
-covered separately in test_model), which keeps these tests fast and
-independent of the model weights.
+These cover request/response logic only -- routing, response shape, the
+readiness gate, and error handling. The model is mocked (it's covered in
+test_model.py), so these run in milliseconds and need no model weights.
 
-Assumptions (adjust if your layout differs):
-  * The handler lives in `app.py` as `handler`.
-  * `app.py` brings `encode` into its namespace, e.g.
-    `from model import encode`. We patch `app.encode` -- the name as it is
-    *used* inside the handler -- not wherever encode is defined.
+main.py does `import model`, so patching `main.model.encode` patches the
+name as the app actually uses it.
 """
-
-import json
 
 import numpy as np
 import pytest
 from unittest.mock import patch
+from fastapi.testclient import TestClient
 
-import app
+import main
 
-
-FAKE_EMBEDDING = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+FAKE_EMBEDDING = np.array([[0.1, 0.2, 0.3]], dtype=np.float32)
 
 
 @pytest.fixture
-def mock_encode():
-    """Replace the real model with a fast stub returning a fixed vector."""
-    with patch("app.encode") as m:
-        m.return_value = FAKE_EMBEDDING
-        yield m
+def mocked():
+    """App with a stubbed model, started through the real lifespan."""
+    with (
+        patch.object(main.model, "load") as load,
+        patch.object(main.model, "encode", return_value=FAKE_EMBEDDING) as encode,
+        patch.object(main.model, "providers", return_value=["CPUExecutionProvider"]),
+    ):
+        with TestClient(main.app) as client:
+            yield client, load, encode
 
 
-def make_event(body):
-    """Minimal API-Gateway-style event. `body` is the raw string Lambda
-    receives, or None to simulate a missing body."""
-    return {"body": body}
+# --- Probes -------------------------------------------------------------
+
+def test_healthz_is_ok(mocked):
+    client, _, _ = mocked
+    resp = client.get("/healthz")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+
+def test_readyz_after_startup(mocked):
+    client, load, _ = mocked
+    resp = client.get("/readyz")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ready"
+    load.assert_called_once()
+
+
+def test_readyz_is_503_before_startup():
+    """Constructing TestClient without entering it skips the lifespan, which
+    is the same state as a pod that hasn't finished loading the model."""
+    client = TestClient(main.app)
+    assert client.get("/readyz").status_code == 503
 
 
 # --- Happy path ---------------------------------------------------------
 
-def test_happy_path_returns_200_and_embedding(mock_encode):
-    event = make_event(json.dumps({"text": "hello world"}))
+def test_single_text_returns_200_and_embedding(mocked):
+    client, _, encode = mocked
+    resp = client.post("/embed", json={"text": "hello world"})
 
-    resp = app.handler(event, None)
-
-    assert resp["statusCode"] == 200
-    payload = json.loads(resp["body"])
-    assert payload["embedding"] == FAKE_EMBEDDING.tolist()
-
-
-def test_encode_called_with_extracted_text(mock_encode):
-    event = make_event(json.dumps({"text": "hello world"}))
-
-    app.handler(event, None)
-
-    mock_encode.assert_called_once_with("hello world")
+    assert resp.status_code == 200
+    assert resp.json()["embedding"] == FAKE_EMBEDDING.tolist()
+    encode.assert_called_once_with("hello world")
 
 
-def test_missing_text_key_defaults_to_empty_string(mock_encode):
-    event = make_event(json.dumps({"foo": "bar"}))
+def test_list_of_texts_is_passed_through(mocked):
+    client, _, encode = mocked
+    texts = ["hello world", "how are you"]
+    resp = client.post("/embed", json={"text": texts})
 
-    resp = app.handler(event, None)
-
-    assert resp["statusCode"] == 200
-    mock_encode.assert_called_once_with("")
-
-
-# --- Missing body -------------------------------------------------------
-
-def test_missing_body_returns_400(mock_encode):
-    resp = app.handler(make_event(None), None)
-
-    assert resp["statusCode"] == 400
-    assert json.loads(resp["body"]) == {"error": "missing body"}
-    mock_encode.assert_not_called()
+    assert resp.status_code == 200
+    encode.assert_called_once_with(texts)
 
 
-def test_body_key_absent_returns_400(mock_encode):
-    resp = app.handler({}, None)  # no "body" key at all
+def test_missing_text_key_defaults_to_empty_string(mocked):
+    client, _, encode = mocked
+    resp = client.post("/embed", json={"foo": "bar"})
 
-    assert resp["statusCode"] == 400
-    mock_encode.assert_not_called()
-
-
-# --- Malformed input ----------------------------------------------------
-# The handler catches json.JSONDecodeError and returns a 400 rather than
-# letting the invocation crash.
-
-def test_malformed_json_returns_400(mock_encode):
-    resp = app.handler(make_event("{not valid json"), None)
-
-    assert resp["statusCode"] == 400
-    mock_encode.assert_not_called()
+    assert resp.status_code == 200
+    encode.assert_called_once_with("")
 
 
-def test_empty_string_body_returns_400(mock_encode):
-    # "" is not None, so it reaches the parse, which fails -> 400.
-    resp = app.handler(make_event(""), None)
+# --- Bad input ----------------------------------------------------------
+# The RequestValidationError handler turns FastAPI's default 422 into the
+# 400 the frontend and the Grafana dashboard expect.
 
-    assert resp["statusCode"] == 400
-    mock_encode.assert_not_called()
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"text": 123},
+        {"text": {"nested": "object"}},
+        {"text": [1, 2, 3]},
+    ],
+)
+def test_wrong_text_type_returns_400(mocked, body):
+    client, _, encode = mocked
+    resp = client.post("/embed", json=body)
+
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "invalid request body"}
+    encode.assert_not_called()
+
+
+def test_malformed_json_returns_400(mocked):
+    client, _, encode = mocked
+    resp = client.post(
+        "/embed",
+        content="{not valid json",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert resp.status_code == 400
+    encode.assert_not_called()
+
+
+def test_missing_body_returns_400(mocked):
+    client, _, encode = mocked
+    resp = client.post("/embed")
+
+    assert resp.status_code == 400
+    encode.assert_not_called()
+
+
+# --- Failure inside the model ------------------------------------------
+
+def test_model_failure_is_not_swallowed(mocked):
+    """A model blow-up must surface as a 5xx, not a 200 with junk."""
+    client, _, encode = mocked
+    encode.side_effect = RuntimeError("session died")
+
+    with pytest.raises(RuntimeError):
+        client.post("/embed", json={"text": "hello"})

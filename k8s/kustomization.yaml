@@ -1,0 +1,39 @@
+# k8s/kustomization.yaml
+#
+# `kubectl apply -k k8s` is now the deploy command.
+#
+# traefik-gateway.yaml is deliberately absent: it's a k3s HelmChartConfig that
+# reconfigures the cluster's own Traefik install, applied once at bootstrap,
+# not part of the app's desired state.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 00-namespace.yaml
+  - gateway.yaml
+  - deployment.yaml
+  - service.yaml
+  - route.yaml
+  - frontend.yaml
+  - frontend-route.yaml
+  - otel-rbac.yaml
+  - otel-config.yaml
+  - otel-collector.yaml
+
+# Replaces the hand-maintained k8s/frontend-configmap.yaml, which was a copy
+# of these files and would drift the moment you edited one. Delete that file.
+#
+# The generated name gets a content hash suffix (frontend-static-7f9c...),
+# and kustomize rewrites the volume reference in frontend.yaml to match, so
+# editing app.js now rolls the nginx pods instead of silently serving stale
+# assets from a mounted ConfigMap.
+configMapGenerator:
+  - name: frontend-static
+    files:
+      - frontend/index.html
+      - frontend/app.js
+      - frontend/chart.js
+      - frontend/config.js
+      - frontend/embeddings.js
+      - frontend/linalg.js
+      - frontend/styles.css

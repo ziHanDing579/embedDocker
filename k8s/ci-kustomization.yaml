@@ -1,0 +1,57 @@
+# k8s/ci/kustomization.yaml
+#
+# The same manifests, minus the things a GitHub runner can't provide.
+# Everything else -- probes, Services, routes, the collector, the frontend
+# ConfigMap -- is applied exactly as in production.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../
+
+# deployment.yaml pins embed-api:0.1.0; CI builds embed-api:ci and side-loads
+# it into the kind node. imagePullPolicy stays Never either way.
+images:
+  - name: embed-api
+    newTag: ci
+
+patches:
+  # Removals: strategic merge can't delete keys, so these go through JSON 6902.
+  #   runtimeClassName: nvidia -> no nvidia RuntimeClass on kind, pod won't start
+  #   limits.nvidia.com/gpu    -> no device plugin, pod stays Pending forever
+  - target:
+      kind: Deployment
+      name: embed-api
+    patch: |-
+      - op: remove
+        path: /spec/template/spec/runtimeClassName
+      - op: remove
+        path: /spec/template/spec/containers/0/resources/limits
+
+  # Overrides. env merges by name, so OTEL_SERVICE_NAME and
+  # OTEL_EXPORTER_OTLP_ENDPOINT survive untouched -- CI still exports to the
+  # in-cluster collector.
+  #
+  # ORT_PROVIDERS is pinned to CPU rather than left to fall back: the default
+  # list tries CUDA first, and the failed-provider warning it prints on a
+  # driverless host is noise that looks like a real failure in the log.
+  #
+  # startupProbe gets more headroom because CPU inference on a shared runner
+  # is slower than the 4090 this was tuned against (30 * 2s = 60s is tight).
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: embed-api
+      spec:
+        template:
+          spec:
+            containers:
+              - name: api
+                env:
+                  - name: REQUIRE_GPU
+                    value: "0"
+                  - name: ORT_PROVIDERS
+                    value: CPUExecutionProvider
+                startupProbe:
+                  failureThreshold: 90
