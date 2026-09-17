@@ -17,3 +17,6 @@ ONNX runtime helps to do two things - one, reduce package size and two, reduce C
 Given that the project runs on AWS Lambda, the container needed to go to the ECR. For this repo, I chose to go with a manually created ECR role and policy instead of IaC. I could have used terraform, but it adds an additional layer when I've already split the responsibilities by having a container repo.
 
 As for the SSM to store my tags, the main reason is that I would like the Terraform pipeline to be more automated. Having a `latest` tag would mean that Terraform cannot actively detect a change in the image, and hardcoding the value goes against IaC principles. So SSM and SHA hashes as tags seemed the natural choice.
+
+### K8S Version
+I have created a new K8S version of the same app on the `k8s-build` branch. You can find additional details on the readme there.
